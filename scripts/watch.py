@@ -16,7 +16,13 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from download import download, is_url  # noqa: E402
-from frames import MAX_FPS, auto_fps, auto_fps_focus, extract, format_time, get_metadata, parse_time  # noqa: E402
+from frames import (  # noqa: E402
+    MAX_FPS, auto_fps, auto_fps_focus, extract, extract_scene_change,
+    format_time, get_metadata, parse_time, select_hero_frames,
+)
+from hook import analyse_hook  # noqa: E402
+from pacing import compute_pacing  # noqa: E402
+from report import write_report  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
@@ -43,6 +49,22 @@ def main() -> int:
         choices=["groq", "openai"],
         default=None,
         help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
+    )
+    ap.add_argument(
+        "--intent",
+        type=str,
+        default="",
+        help="Why the user wants to watch this video. Shapes report.md TL;DR + entity emphasis.",
+    )
+    ap.add_argument(
+        "--no-scene-change",
+        action="store_true",
+        help="Force uniform frame sampling (skip scene-change detection).",
+    )
+    ap.add_argument(
+        "--no-hook-microscope",
+        action="store_true",
+        help="Skip the dense 0-10s hook re-pass.",
     )
     args = ap.parse_args()
 
@@ -94,15 +116,60 @@ def main() -> int:
     )
     print(f"[watch] extracting ~{target} frames at {fps:.3f} fps over {scope}…", file=sys.stderr)
 
-    frames = extract(
-        video_path,
-        work / "frames",
-        fps=fps,
-        resolution=args.resolution,
-        max_frames=max_frames,
-        start_seconds=start_sec,
-        end_seconds=end_sec,
+    use_scene = (not args.no_scene_change) and not focused and args.fps is None
+    if use_scene:
+        print("[watch] extracting scene-change frames (one per shot)…", file=sys.stderr)
+        frames = extract_scene_change(
+            video_path,
+            work / "frames",
+            scene_threshold=0.3,
+            resolution=args.resolution,
+            max_frames=max_frames,
+            uniform_fallback_min=10,
+            start_seconds=start_sec,
+            end_seconds=end_sec,
+        )
+        sampling_mode = (
+            "scene-change" if frames and frames[0].get("source") == "scene-change"
+            else "uniform-fallback"
+        )
+    else:
+        frames = extract(
+            video_path,
+            work / "frames",
+            fps=fps,
+            resolution=args.resolution,
+            max_frames=max_frames,
+            start_seconds=start_sec,
+            end_seconds=end_sec,
+        )
+        sampling_mode = "uniform"
+
+    # Pacing: derive scene-change timestamps from frame metadata.
+    if sampling_mode == "scene-change":
+        scene_times = [f["timestamp_seconds"] for f in frames]
+    else:
+        scene_times = []
+    pacing = compute_pacing(
+        scene_times=scene_times,
+        video_duration=effective_duration,
+        motion_scores=None,
     )
+
+    # Hook microscope: dense pass over [0, 10s] when not in focused mode.
+    if (not args.no_hook_microscope) and (not focused) and full_duration >= 30.0:
+        print("[watch] running hook microscope on first 10s…", file=sys.stderr)
+        hook_backend, hook_key = (None, None)
+        if not args.no_whisper:
+            hook_backend, hook_key = load_api_key(args.whisper)
+        hook_result = analyse_hook(
+            video_path, work,
+            backend=hook_backend, api_key=hook_key,
+            full_video_duration=full_duration,
+        )
+    else:
+        hook_result = {"frames": [], "words": [], "segments": [], "ran": False,
+                       "skipped_reason": "focused mode or short video or --no-hook-microscope"}
 
     transcript_segments: list[dict] = []
     transcript_text: str | None = None
@@ -144,6 +211,22 @@ def main() -> int:
             )
 
     info = dl.get("info") or {}
+
+    # Build report.md (the ingest-ready artifact).
+    hero_frames = select_hero_frames(frames, pacing=pacing)
+    report_path = write_report(
+        out_path=work / "report.md",
+        source=args.source,
+        title=info.get("title") or Path(args.source).stem,
+        duration_seconds=full_duration,
+        intent=args.intent,
+        transcript_segments=transcript_segments,
+        transcript_source=transcript_source,
+        all_frames=frames,
+        hero_frames=hero_frames,
+        pacing=pacing,
+        hook=hook_result,
+    )
 
     print()
     print("# watch: video report")
@@ -221,6 +304,7 @@ def main() -> int:
 
     print()
     print("---")
+    print(f"_Report (ingest-ready): `{report_path}`_")
     print(f"_Work dir: `{work}` — delete when done._")
 
     return 0
