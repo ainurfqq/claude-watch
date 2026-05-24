@@ -1,7 +1,7 @@
 ---
 name: watch
-description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or Whisper API fallback), and hands the result to Claude so it can answer questions about what's in the video.
-argument-hint: "<video-url-or-path> [question]"
+description: Watch a video (URL or local path) like an editor. Extracts scene-change frames, pacing metrics (cuts/min, shot length), and a dense 0-10s hook microscope; pulls transcript from captions or Whisper. Produces an ingest-ready `report.md` and, after answering the user, offers to ingest the analysis into the Second Brain wiki at /Users/taoufik/Second brain/ — tied to *why* the user watched it.
+argument-hint: "<video-url-or-path> [why you're watching it]"
 allowed-tools: Bash, Read, AskUserQuestion
 homepage: https://github.com/bradautomates/claude-video
 repository: https://github.com/bradautomates/claude-video
@@ -12,7 +12,17 @@ user-invocable: true
 
 # /watch — Claude watches a video
 
-You don't have a video input; this skill gives you one. A Python script downloads the video, extracts frames as JPEGs, gets a timestamped transcript (native captions first, then Whisper API as fallback), and prints frame paths. You then `Read` each frame path to see the images and combine them with the transcript to answer the user.
+You don't have a video input; this skill gives you one. A Python script downloads the video, extracts frames as JPEGs (one per detected shot via scene-change), gets a timestamped transcript (native captions first, then Whisper API as fallback), runs editorial pacing metrics, and microscopes the first 10 seconds at higher density. You then `Read` each frame path to see the images, combine them with the transcript to answer the user, fill the structured `report.md`, and offer to ingest the analysis into Taoufik's Second Brain.
+
+## What v2 does differently
+
+- **Scene-change frame sampling** — one frame per detected shot instead of uniform ticks. Cuts the frame budget on long videos while capturing every transition.
+- **Editorial pacing metrics** — cuts/min, mean shot length, motion (when available). Lets you reason about pacing the way an editor does.
+- **Hook microscope** — first 10s auto-runs at 2 fps + word-level Whisper. The single most leveraged 10 seconds of any video deserves dense treatment.
+- **Structured `report.md`** — every watch emits an ingest-shaped report at `<workdir>/report.md` with TL;DR, key moments, hook breakdown, editorial profile, quotable moments, entities, concepts, and transcript. Narrative sections are emitted as `<!-- pending Claude fill: ... -->` markers — you fill them in before offering ingest.
+- **Step 4.5 — Ingest gate** — after answering the user, you ask once: "Want to ingest this into your Second Brain?" If yes, you read `/Users/taoufik/Second brain/CLAUDE.md` and run that vault's Ingest op against the report.
+
+None of the above add new dependencies — pure ffmpeg + stdlib + the existing Whisper backend.
 
 ## Step 0 — Setup preflight (runs every `/watch` invocation, silent on success)
 
@@ -67,22 +77,26 @@ Within a single session, you can skip Step 0 on follow-up `/watch` calls — onc
 
 ## How to invoke
 
-**Step 1 — parse the user input.** Separate the video source (URL or path) from any question the user asked. Example: `/watch https://youtu.be/abc what language is this in?` → source = `https://youtu.be/abc`, question = `what language is this in?`.
+**Step 1 — parse the user input.** Separate the video source from any question the user asked. The question (or the user's prior stated interest) IS the intent — pass it to the script via `--intent`. Example: `/watch https://youtu.be/abc what's the hook pattern?` → source = `https://youtu.be/abc`, intent = `what's the hook pattern?`. If no question is given, use a brief inferred intent ("general summary") so the report's TL;DR has a lens. The intent shapes how the report's TL;DR and entity/concept sections get filled at Step 4 — same video with intent "pricing tactics" vs "editing style" produces different reports.
 
 **Step 2 — run the watch script.** Pass the source verbatim. Do not shell-escape it yourself beyond normal quoting:
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "<source>"
+python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "<source>" --intent "<intent string>"
 ```
+
+Pass `--intent` whenever you have any signal from the user about why they want this video — the question they asked, a stated goal, or a brief inferred summary. Empty `--intent` works but produces less-targeted report sections.
 
 Optional flags:
 - `--start T` / `--end T` — focus on a section. Accepts `SS`, `MM:SS`, or `HH:MM:SS`. When either is set, fps auto-scales denser (see "Focusing on a section" below).
 - `--max-frames N` — lower the cap for tighter token budget (e.g. `--max-frames 40`)
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
-- `--fps F` — override auto-fps (clamped to 2 fps max)
+- `--fps F` — override auto-fps (clamped to 2 fps max). Setting `--fps` disables scene-change sampling.
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
 - `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
+- `--no-scene-change` — force uniform frame sampling (debug only; usually leave on)
+- `--no-hook-microscope` — skip the 0-10s dense pass (saves ~1 Whisper call)
 
 ### Focusing on a section (higher frame rate)
 
@@ -115,13 +129,54 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "$URL" --start 1:12:00
 
 **Step 3 — Read every frame path the script lists.** The Read tool renders JPEGs directly as images for you. Read all frames in a single message (parallel tool calls) so you see them together. The frames are in chronological order with a `t=MM:SS` timestamp so you can align them to the transcript.
 
-**Step 4 — answer the user.** You now have two streams of evidence:
+**Step 4 — answer the user, then fill the report.** You now have three streams of evidence:
 - **Frames** — what's on screen at each timestamp
-- **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)` or `whisper (openai)` = transcribed by API).
+- **Transcript** — what's said at each timestamp
+- **`report.md`** — structured artifact at `<workdir>/report.md` with `<!-- pending Claude fill: ... -->` markers
 
-If the user asked a specific question, answer it directly citing timestamps. If they didn't ask anything, summarize what happens in the video — structure, key moments, notable visuals, spoken content.
+First, answer the user's question in chat citing timestamps.
 
-**Step 5 — clean up.** The script prints a working directory at the end. If the user isn't going to ask follow-ups about this video, delete it with `rm -rf <dir>`. If they might, leave it in place.
+Then, **fill in the pending markers in `report.md` using the Edit tool**. Walk every `<!-- pending Claude fill: ... -->` in order:
+- **TL;DR** — 3-5 bullets through the lens of the user's intent (read from the frontmatter)
+- **Key moments** — 5-10 timestamped bullets
+- **Hook microscope interpretation** — frame-by-frame: visual change × what's said; identify the hook pattern (question, contrarian claim, in-medias-res, demo-first, etc.)
+- **Editorial profile fingerprint** — one-line style summary inferred from pacing numbers + hero frames
+- **Quotable moments** — top 3-5 punchy, standalone lines from the transcript
+- **Entities mentioned** — people, companies, tools, places — formatted to match wiki/entities/ slugs (kebab-case, lowercase). Use `[[wikilink]]` style.
+- **Concepts surfaced** — frameworks, mental models, named patterns — short gist each
+
+The fully-filled `report.md` is what gets ingested at Step 4.5. Do not skip the fill — empty markers won't ingest cleanly.
+
+**Step 4.5 — Offer ingest into the Second Brain.** Use `AskUserQuestion` once, with these options (do NOT skip this step unless the user explicitly said "don't ingest" before /watch ran):
+
+> **Question:** "Want to ingest this into your Second Brain?"
+> - **Yes — same angle** ("<intent>")
+> - **Yes — different angle** (user specifies in the notes field)
+> - **Stage to `raw/watched/` for later**
+> - **No, drop it**
+
+Routing based on response:
+
+**A. Yes (same or different angle):**
+1. Derive the slug: take the video title from `report.md` frontmatter, slugify (lowercase, ASCII-only, hyphens, max 60 chars), append `-YYYY-MM-DD`. Example: `me-at-the-zoo-2026-05-24`.
+2. Create `/Users/taoufik/Second brain/raw/watched/<slug>/`.
+3. Copy `report.md` and every hero frame (filenames listed in the report's frontmatter under `hero_frames:`) to that directory.
+4. **If "different angle":** Re-edit the TL;DR + Entities + Concepts sections of the copied report to reflect the new angle the user specified, before running ingest.
+5. **Read `/Users/taoufik/Second brain/CLAUDE.md`** to refresh the Ingest op definition — that file is authoritative; this skill must not duplicate its steps.
+6. Execute the Ingest op against `raw/watched/<slug>/report.md` exactly as `/Users/taoufik/Second brain/CLAUDE.md` defines it (read source → summarize → identify entities + concepts → update/create wiki pages → create sources page → contradiction check → update index → link-integrity check → log entry).
+7. Report back to the user in chat: which entity pages were touched, which concept pages were created, any contradictions flagged, the path to the new `wiki/sources/<slug>.md`, and the `log.md` entry written.
+
+**B. Stage to `raw/watched/` for later:**
+1. Same slug derivation (step 1 above).
+2. Copy `report.md` + hero frames into `/Users/taoufik/Second brain/raw/watched/<slug>/`.
+3. Do NOT touch the wiki. Do NOT append to `log.md`.
+4. Tell the user in chat: "Staged at `Second brain/raw/watched/<slug>/`. Run the Ingest op from inside Second Brain when you're ready."
+
+**C. No, drop it:** proceed to Step 5 (cleanup).
+
+The "different angle" path is what makes /watch truly plug-and-play — the user can watch a video for one reason, then on the way out decide it's actually more useful for a different concept, and the resulting wiki entry reframes accordingly.
+
+**Step 5 — clean up.** The script prints a working directory at the end. If you ingested (Step 4.5 path A), the hero frames + report.md are already copied to Second Brain — you can `rm -rf` the original workdir. If you staged (path B), same — the workdir copy is no longer needed. If the user picked "no, drop it" (path C) and isn't going to ask follow-ups, delete with `rm -rf <dir>`. If they might ask follow-ups, leave it in place.
 
 ## Transcription
 
@@ -141,6 +196,8 @@ Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are 
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
 - **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
 - **Whisper request fails** → the error is printed to stderr (likely: invalid key, rate limit, or 25 MB upload limit on a very long video). The report will say "none available" for transcript. You can retry with `--whisper openai` if Groq failed (or vice versa).
+- **Report has unfilled `<!-- pending Claude fill: ... -->` markers** → you skipped Step 4. Go back, read the report, fill every marker via Edit, then offer ingest. Never ingest a half-filled report — the Second Brain Ingest op will produce sparse/wrong entity pages.
+- **Ingest fails partway** → do not roll back. The Second Brain Ingest op is idempotent on re-run (it updates existing pages rather than duplicating). Tell the user what failed, leave the staged artifact in `raw/watched/<slug>/`, and they can re-run by saying "ingest the staged report at `<slug>`".
 
 ## Token efficiency
 
@@ -160,14 +217,19 @@ If you already watched a video this session and the user asks a follow-up, do **
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
 - Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
+- Reads `/Users/taoufik/Second brain/CLAUDE.md` at orchestration time (only when ingest is requested) to follow that vault's Ingest operation definition
+- Writes a structured `report.md` plus copies of hero frames into `/Users/taoufik/Second brain/raw/watched/<slug>/` when the user consents to ingest or stage
+- When ingest is consented to: reads and writes pages under `/Users/taoufik/Second brain/wiki/` (entities, concepts, sources, index.md) and appends to `/Users/taoufik/Second brain/log.md` — exactly the actions defined by that vault's Ingest op
 
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
 - Does not access any platform account (no login, no session cookies, no posting)
 - Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
-- Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 5)
+- Does not persist anything outside the working directory and `~/.config/watch/.env` (and Second Brain when ingest is consented to) — clean up the working directory when you're done (Step 5)
+- Does not write to the Second Brain without explicit user consent at the Step 4.5 prompt
+- Does not silently overwrite wiki claims — contradictions surface as WARN flags per the Ingest op contract
 
-**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction), `scripts/transcribe.py` (caption selection + Whisper orchestration), `scripts/whisper.py` (Groq / OpenAI clients), `scripts/setup.py` (preflight + installer)
+**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg uniform + scene-change extraction + hero selection), `scripts/pacing.py` (editorial metrics), `scripts/hook.py` (0-10s microscope), `scripts/report.py` (structured report emitter), `scripts/transcribe.py` (caption selection + Whisper orchestration), `scripts/whisper.py` (Groq / OpenAI clients, supports word-level timestamps), `scripts/setup.py` (preflight + installer)
 
 Review scripts before first use to verify behavior.
