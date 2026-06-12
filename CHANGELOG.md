@@ -2,9 +2,9 @@
 
 All notable changes to `/watch` are documented here.
 
-## [0.2.0] — 2026-05-25 (fork by taoufik)
+## [0.2.0] — 2026-05-25
 
-Fork of [bradautomates/claude-video](https://github.com/bradautomates/claude-video) v0.1.3. Upstream pipeline (yt-dlp + ffmpeg + Whisper) preserved; everything below is additive.
+Based on [bradautomates/claude-video](https://github.com/bradautomates/claude-video) v0.1.3 by Bradley Bonanno (MIT). Its pipeline (yt-dlp + ffmpeg + Whisper) is preserved; everything below is additive.
 
 ### Added
 - Scene-change frame extraction in `scripts/frames.py` — `extract_scene_change()` + `select_hero_frames()` using ffmpeg's `select=gt(scene,...)` filter. One frame per detected shot instead of uniform every-N-seconds sampling. Keeps token cost flat on long videos. Uniform sampling still available as a fallback for static/screen-recorded sources.
@@ -18,7 +18,7 @@ Fork of [bradautomates/claude-video](https://github.com/bradautomates/claude-vid
 
 ### Changed
 - `SKILL.md` is now a v2 contract — describes the structured report, the marker-fill step, and the vault config. Backwards-compatible with /watch invocations that don't care about ingest.
-- README documents what this fork adds over upstream and the `$WATCH_VAULT_DIR` configuration.
+- README documents the added features and the `$WATCH_VAULT_DIR` configuration.
 
 ## [0.1.3] — 2026-05-09
 
