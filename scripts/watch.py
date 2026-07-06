@@ -17,8 +17,9 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from download import download, is_url  # noqa: E402
 from frames import (  # noqa: E402
-    MAX_FPS, auto_fps, auto_fps_focus, extract, extract_scene_change,
-    format_time, get_metadata, parse_time, select_hero_frames,
+    MAX_FPS, auto_fps, auto_fps_focus, extract, extract_at_times,
+    extract_scene_change, format_time, get_metadata, parse_time,
+    parse_timestamps, select_hero_frames,
 )
 from hook import analyse_hook  # noqa: E402
 from pacing import compute_pacing  # noqa: E402
@@ -27,13 +28,67 @@ from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
 
+# token-burner lifts the 100-frame hard cap; this is "effectively no cap" for
+# any real video (auto-fps still bounds fps ≤ 2.0, so frame count ≈ 2 × seconds).
+UNCAPPED_MAX_FRAMES = 100_000
+
+# --detail presets over the existing frame/transcript knobs. `max_frames=None`
+# means "uncapped" (token-burner). `balanced` reproduces the pre-flag default.
+DETAIL_PRESETS = {
+    "transcript":   {"extract_frames": False, "max_frames": 0,    "no_scene_change": True,  "no_hook_microscope": True},
+    "efficient":    {"extract_frames": True,  "max_frames": 50,   "no_scene_change": True,  "no_hook_microscope": True},
+    "balanced":     {"extract_frames": True,  "max_frames": 80,   "no_scene_change": False, "no_hook_microscope": False},
+    "token-burner": {"extract_frames": True,  "max_frames": None,  "no_scene_change": False, "no_hook_microscope": False},
+}
+
+
+def resolve_detail_settings(
+    detail: str,
+    max_frames_arg: int | None,
+    no_scene_change_arg: bool,
+    no_hook_microscope_arg: bool,
+) -> dict:
+    """Resolve a --detail preset onto the existing knobs.
+
+    Explicit flags win over the preset: a user-supplied --max-frames overrides
+    the preset's frame count, and --no-scene-change / --no-hook-microscope force
+    those off regardless of the preset. Both store_true flags only ever push a
+    knob toward "off", and so do the presets that touch them, so OR-ing the
+    explicit flag with the preset value is the correct precedence.
+
+    `balanced` reproduces the pre-flag default exactly (max_frames=80,
+    scene-change on, hook on) — this is the regression guard.
+    """
+    preset = DETAIL_PRESETS[detail]
+
+    if max_frames_arg is not None:
+        # Explicit --max-frames: honor the number. token-burner lifts the 100
+        # hard cap; every other mode keeps it (matches prior behavior).
+        max_frames = max_frames_arg if detail == "token-burner" else min(max_frames_arg, 100)
+    elif preset["max_frames"] is None:
+        max_frames = UNCAPPED_MAX_FRAMES
+    else:
+        max_frames = min(preset["max_frames"], 100)
+
+    return {
+        "extract_frames": preset["extract_frames"],
+        "max_frames": max_frames,
+        "no_scene_change": bool(no_scene_change_arg) or preset["no_scene_change"],
+        "no_hook_microscope": bool(no_hook_microscope_arg) or preset["no_hook_microscope"],
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="watch",
         description="Download a video, extract auto-scaled frames, and surface the transcript.",
     )
     ap.add_argument("source", help="Video URL or local file path")
-    ap.add_argument("--max-frames", type=int, default=80, help="Cap on frame count (default 80, hard max 100)")
+    ap.add_argument(
+        "--max-frames", type=int, default=None,
+        help="Cap on frame count. Overrides the --detail preset. Hard max 100 "
+             "unless --detail token-burner. Default is set by --detail (balanced=80).",
+    )
     ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")
     ap.add_argument("--fps", type=float, default=None, help="Override auto-fps")
     ap.add_argument("--start", type=str, default=None, help="Range start (SS, MM:SS, or HH:MM:SS)")
@@ -66,9 +121,36 @@ def main() -> int:
         action="store_true",
         help="Skip the dense 0-10s hook re-pass.",
     )
+    ap.add_argument(
+        "--detail",
+        choices=["transcript", "efficient", "balanced", "token-burner"],
+        default="balanced",
+        help="Token-budget preset over the frame/transcript knobs. "
+             "transcript=no frames (transcript only); efficient=uniform ≤50 frames; "
+             "balanced=default (scene-change ≤80, hook on); "
+             "token-burner=scene-change, frame cap lifted. Explicit "
+             "--max-frames / --no-scene-change / --no-hook-microscope override it.",
+    )
+    ap.add_argument(
+        "--timestamps",
+        type=str,
+        default=None,
+        help="Comma-separated times (SS, MM:SS, or HH:MM:SS) to grab exactly one "
+             "frame each. Overrides --detail frame selection and scene-change/uniform sampling.",
+    )
     args = ap.parse_args()
 
-    max_frames = min(args.max_frames, 100)
+    detail = resolve_detail_settings(
+        args.detail,
+        args.max_frames,
+        args.no_scene_change,
+        args.no_hook_microscope,
+    )
+    max_frames = detail["max_frames"]
+    extract_frames = detail["extract_frames"]
+    no_scene_change = detail["no_scene_change"]
+    no_hook_microscope = detail["no_hook_microscope"]
+    explicit_times = parse_timestamps(args.timestamps)
 
     if args.out_dir:
         work = Path(args.out_dir).expanduser().resolve()
@@ -116,8 +198,27 @@ def main() -> int:
     )
     print(f"[watch] extracting ~{target} frames at {fps:.3f} fps over {scope}…", file=sys.stderr)
 
-    use_scene = (not args.no_scene_change) and not focused and args.fps is None
-    if use_scene:
+    use_scene = (not no_scene_change) and not focused and args.fps is None
+    if explicit_times:
+        print(
+            f"[watch] extracting {len(explicit_times)} frame(s) at explicit timestamps…",
+            file=sys.stderr,
+        )
+        frames = extract_at_times(
+            video_path,
+            work / "frames",
+            times=explicit_times,
+            resolution=args.resolution,
+        )
+        sampling_mode = "timestamps"
+    elif not extract_frames:
+        print(
+            "[watch] --detail transcript: skipping frame extraction (transcript only)…",
+            file=sys.stderr,
+        )
+        frames = []
+        sampling_mode = "none"
+    elif use_scene:
         print("[watch] extracting scene-change frames (one per shot)…", file=sys.stderr)
         frames = extract_scene_change(
             video_path,
@@ -157,7 +258,7 @@ def main() -> int:
     )
 
     # Hook microscope: dense pass over [0, 10s] when not in focused mode.
-    if (not args.no_hook_microscope) and (not focused) and full_duration >= 30.0:
+    if (not no_hook_microscope) and (not focused) and full_duration >= 30.0:
         print("[watch] running hook microscope on first 10s…", file=sys.stderr)
         hook_backend, hook_key = (None, None)
         if not args.no_whisper:

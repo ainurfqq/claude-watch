@@ -157,7 +157,9 @@ Focused on a specific section — denser frame budget, lower token cost:
 
 Other knobs (passed to `scripts/watch.py`):
 
-- `--max-frames N` — lower the frame cap for a tighter token budget.
+- `--detail {transcript,efficient,balanced,token-burner}` — token-budget preset (default `balanced`). `transcript` = transcript only, no frames; `efficient` = uniform ≤50 frames, hook off; `balanced` = default scene-change pass; `token-burner` = scene-change with the frame cap lifted. Explicit `--max-frames`/`--no-scene-change`/`--no-hook-microscope` win over the preset.
+- `--timestamps 5,1:30,2:00` — grab one frame at each named time (`SS`/`MM:SS`/`HH:MM:SS`); overrides `--detail` frame selection. Out-of-range times are skipped.
+- `--max-frames N` — lower the frame cap for a tighter token budget (overrides `--detail`).
 - `--resolution W` — bump frame width to 1024 px when Claude needs to read on-screen text (slides, terminals, code).
 - `--fps F` — override the auto-fps calculation (still capped at 2 fps).
 - `--whisper groq|openai` — force a specific Whisper backend.

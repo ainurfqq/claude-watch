@@ -7,3 +7,5 @@ allowed-tools: [Bash, Read, AskUserQuestion]
 Invoke the `watch` skill (defined in SKILL.md) with the user's arguments: $ARGUMENTS
 
 Follow the skill's full pipeline: preflight setup check → download via yt-dlp → extract frames at auto-scaled fps → pull captions or Whisper transcript → Read each frame → answer the user grounded in frames and transcript. If the user provided no arguments, ask them for a video URL or local path before proceeding.
+
+Useful flags (see SKILL.md for the full list): `--detail {transcript,efficient,balanced,token-burner}` sets a token-budget preset (default `balanced`); `--timestamps 5,1:30,2:00` grabs one frame at each named time. Both are documented under "Optional flags" in SKILL.md.

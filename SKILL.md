@@ -111,8 +111,10 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "<source>" --intent "<intent stri
 Pass `--intent` whenever you have any signal from the user about why they want this video — the question they asked, a stated goal, or a brief inferred summary. Empty `--intent` works but produces less-targeted report sections.
 
 Optional flags:
+- `--detail {transcript,efficient,balanced,token-burner}` — token-budget preset over the frame/transcript knobs (default `balanced`). `transcript` = no frames, transcript only; `efficient` = uniform sampling capped at 50 frames, hook off; `balanced` = today's default (scene-change ≤80, hook on); `token-burner` = scene-change with the frame cap lifted (uncapped — burns tokens on long videos). Explicit `--max-frames` / `--no-scene-change` / `--no-hook-microscope` override the preset.
+- `--timestamps T1,T2,…` — grab exactly one frame at each time (`SS`, `MM:SS`, or `HH:MM:SS`). Overrides `--detail` frame selection and scene-change/uniform sampling. Out-of-range times are skipped with a warning.
 - `--start T` / `--end T` — focus on a section. Accepts `SS`, `MM:SS`, or `HH:MM:SS`. When either is set, fps auto-scales denser (see "Focusing on a section" below).
-- `--max-frames N` — lower the cap for tighter token budget (e.g. `--max-frames 40`)
+- `--max-frames N` — lower the cap for tighter token budget (e.g. `--max-frames 40`). Overrides the `--detail` preset.
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
 - `--fps F` — override auto-fps (clamped to 2 fps max). Setting `--fps` disables scene-change sampling.
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)

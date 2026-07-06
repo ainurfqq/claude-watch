@@ -2,6 +2,21 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.2.1] — 2026-07-06
+
+Cherry-picks two flags that [bradautomates/claude-video](https://github.com/bradautomates/claude-video) shipped in its v0.2.0 (after this fork branched off brad's v0.1.3). Both are additive — existing invocations are unchanged.
+
+### Added
+- `--detail {transcript,efficient,balanced,token-burner}` in `scripts/watch.py` (based on brad v0.2.0) — a token-budget preset over the existing frame/transcript knobs, resolved via `resolve_detail_settings()`. `transcript` = no frames (transcript only); `efficient` = uniform sampling capped at 50 frames, hook off; `balanced` (default) = the pre-existing default (scene-change ≤80, hook on); `token-burner` = scene-change with the 100-frame hard cap lifted. Explicit `--max-frames` / `--no-scene-change` / `--no-hook-microscope` override the preset (argparse now uses sentinel defaults to detect user-set flags).
+- `--timestamps T1,T2,…` in `scripts/watch.py` + `extract_at_times()` / `select_valid_times()` in `scripts/frames.py` (based on brad v0.2.0) — grab exactly one frame at each named time (`SS` / `MM:SS` / `HH:MM:SS`, parsed via `parse_timestamps()`). Returns the same frame-dict shape as `extract()`, sorted chronologically; out-of-range times are skipped with a stderr warning. Overrides `--detail` frame selection.
+- 16 unit tests under `scripts/tests/` (`test_detail_modes.py`, `test_timestamps.py`; stdlib `unittest`) covering preset→knob resolution, explicit-flag precedence, timestamp parsing, and out-of-range handling.
+
+### Changed
+- `SKILL.md`, `README.md`, and `commands/watch.md` document the two new flags.
+
+### Notes
+- `balanced` reproduces the pre-flag default output byte-for-byte (regression-guarded). The fork's real default is `--max-frames 80` (hard max 100), so `balanced` resolves to 80 — not the 100 implied by brad's preset table.
+
 ## [0.2.0] — 2026-05-25
 
 Based on [bradautomates/claude-video](https://github.com/bradautomates/claude-video) v0.1.3 by Bradley Bonanno (MIT). Its pipeline (yt-dlp + ffmpeg + Whisper) is preserved; everything below is additive.

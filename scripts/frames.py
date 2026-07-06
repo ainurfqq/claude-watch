@@ -46,6 +46,26 @@ def parse_time(value: str | float | int | None) -> float | None:
     raise SystemExit(f"Cannot parse time value: {value!r} (expected SS, MM:SS, or HH:MM:SS)")
 
 
+def parse_timestamps(spec: str | None) -> list[float]:
+    """Parse a comma-separated list of times into seconds.
+
+    Each entry accepts SS, MM:SS, or HH:MM:SS (via ``parse_time``). Empty
+    entries are skipped. Order is preserved; callers that need chronological
+    frames rely on ``select_valid_times`` / ``extract_at_times`` to sort.
+    """
+    if not spec:
+        return []
+    out: list[float] = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        t = parse_time(part)
+        if t is not None:
+            out.append(t)
+    return out
+
+
 def format_time(seconds: float) -> str:
     total = int(round(seconds))
     hours, rem = divmod(total, 3600)
@@ -183,6 +203,76 @@ def extract(
         }
         for i, p in enumerate(frames)
     ]
+
+
+def select_valid_times(times: list[float], duration: float) -> list[float]:
+    """Sort requested timestamps ascending and drop invalid ones.
+
+    Negative times and times past ``duration`` (when duration is known, i.e.
+    > 0) are skipped with a stderr warning rather than raising, so a single bad
+    timestamp doesn't abort the whole extraction. Pure — no ffmpeg/network.
+    """
+    valid: list[float] = []
+    for t in sorted(times):
+        if t < 0:
+            print(f"[watch] skipping timestamp {t:.2f}s (negative)", file=sys.stderr)
+            continue
+        if duration > 0 and t > duration:
+            print(
+                f"[watch] skipping timestamp {t:.2f}s (past end of video, {duration:.1f}s)",
+                file=sys.stderr,
+            )
+            continue
+        valid.append(t)
+    return valid
+
+
+def extract_at_times(
+    video_path: str,
+    out_dir: Path,
+    times: list[float],
+    resolution: int = 512,
+) -> list[dict]:
+    """Extract exactly one frame at each requested timestamp (seconds).
+
+    Seeks per timestamp with ``-ss <t> -i … -frames:v 1`` and returns dicts in
+    the SAME shape as ``extract()`` (``index``, ``timestamp_seconds``, ``path``),
+    sorted chronologically. Out-of-range timestamps are skipped (see
+    ``select_valid_times``) so the report still renders.
+    """
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for existing in out_dir.glob("frame_*.jpg"):
+        existing.unlink()
+
+    duration = get_metadata(video_path)["duration_seconds"]
+    valid_times = select_valid_times(times, duration)
+
+    frames: list[dict] = []
+    for i, t in enumerate(valid_times):
+        out_path = out_dir / f"frame_{i:04d}.jpg"
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{t:.3f}",
+            "-i", str(Path(video_path).resolve()),
+            "-frames:v", "1",
+            "-vf", f"scale={resolution}:-2",
+            "-q:v", "4",
+            str(out_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise SystemExit(
+                f"ffmpeg frame extraction failed at {t:.3f}s: {result.stderr.strip()}"
+            )
+        frames.append({
+            "index": i,
+            "timestamp_seconds": round(t, 2),
+            "path": str(out_path),
+        })
+    return frames
 
 
 def extract_scene_change(
